@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Halcón – Trío de IAs</title>
+<style>
+:root{--bg:#eef1f4;--fg:#14202b;--card:#fff;--line:#c9d2db;--btn:#14202b;--btnfg:#fff}
+@media (prefers-color-scheme:dark){:root{--bg:#10171e;--fg:#e8eef3;--card:#1a232c;--line:#2d3a46;--btn:#e8eef3;--btnfg:#10171e}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:"Trebuchet MS",system-ui,sans-serif;line-height:1.45}
+main{max-width:640px;margin:0 auto;padding:14px}
+h1{font-size:1.25rem;margin:0 0 2px}
+.sub{margin:0 0 12px;font-size:.9rem;opacity:.8}
+#stage{position:relative;width:100%;aspect-ratio:4/3;background:#000;border-radius:10px;overflow:hidden;touch-action:none}
+video,canvas.o{position:absolute;inset:0;width:100%;height:100%}
+video{object-fit:fill}
+#empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#fff;text-align:center;padding:20px;font-size:.95rem}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0;align-items:center}
+button,label.btn{position:relative;overflow:hidden;background:var(--btn);color:var(--btnfg);border:0;border-radius:8px;padding:10px 14px;font:inherit;font-size:.95rem;cursor:pointer}
+button.alt{background:transparent;color:var(--fg);border:1px solid var(--line)}
+input[type=file]{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer}
+input[type=text],select{font:inherit;padding:9px 10px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg)}
+input[type=text]{width:9.5em;text-transform:uppercase}
+#zoomRow{width:100%}#zoomRow input{width:70%}
+#status{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px;font-size:.95rem}
+#status b{display:inline-block;min-width:5.5em}
+#bar{height:8px;border-radius:4px;background:var(--line);margin-top:8px;overflow:hidden}
+#fill{height:100%;width:0;background:#1f9d55;transition:width .15s,background .15s}
+.small{font-size:.82rem;opacity:.8;margin-top:6px}
+</style>
+</head>
+<body>
+<main>
+<h1>Halcón: trío de IAs</h1>
+<p class="sub">Tres IAs cooperan: una detecta, otra reconoce el aspecto del carro y otra lee la placa.</p>
+<div id="stage">
+  <video id="v" playsinline muted></video>
+  <canvas id="c" class="o"></canvas>
+  <div id="empty">Activa la cámara o elige un video de prueba.</div>
+</div>
+<div class="row">
+  <button id="cam">Activar cámara</button>
+  <label class="btn">Elegir video<input id="file" type="file" accept="video/*"></label>
+  <button id="reset" class="alt">Soltar objetivo</button>
+</div>
+<div class="row" id="zoomRow" hidden><span>Zoom</span> <input type="range" id="zoom"></div>
+<div class="row">
+  <input type="text" id="plate" maxlength="8" placeholder="Placa (opcional)">
+  <select id="prec"><option value="lite_mobilenet_v2">IA rápida</option><option value="mobilenet_v2">IA precisa (más lenta)</option></select>
+</div>
+<div id="status">
+  <div><b id="st">Cargando</b> <span id="msg">Descargando el modelo de IA...</span></div>
+  <div id="bar"><div id="fill"></div></div>
+  <div class="small" id="plateRead">Placa leída: ninguna</div>
+  <div class="small" id="stats"></div>
+  <div class="small" id="trio"></div>
+</div>
+<p class="small">Todo se procesa en tu teléfono y no se guarda ninguna imagen ni placa. Haz pruebas con un carro cuyo dueño sepa lo que haces y nunca mientras manejas.</p>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/mobilenet@2.1.1/dist/mobilenet.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+const v=$('v'),c=$('c'),ctx=c.getContext('2d'),stage=$('stage'),empty=$('empty');
+const VEH=['car','truck','bus','motorcycle'];
+const W=160,G=16;let H=120;
+let model=null,dets=[],T=null,state='none',running=false,busy=false,fps=0,lastDet=0,detOn=false,img=null,lastF=performance.now();
+const wc=document.createElement('canvas'),wx=wc.getContext('2d',{willReadFrequently:true});
+const hc=document.createElement('canvas');hc.width=hc.height=24;const hx=hc.getContext('2d',{willReadFrequently:true});
+const pc=document.createElement('canvas'),pcx=pc.getContext('2d');
+function fit(){c.width=stage.clientWidth;c.height=stage.clientHeight}
+window.addEventListener('resize',fit);fit();
+
+// ---------- memoria de apariencia: histograma de color en dos mitades (arriba/abajo) ----------
+function hist(b){
+  const vw=v.videoWidth,vh=v.videoHeight;
+  const x0=Math.max(0,(b.x-b.w*.3)*vw),y0=Math.max(0,(b.y-b.h*.3)*vh);
+  const w=Math.max(2,Math.min(vw-x0,b.w*.6*vw)),h=Math.max(2,Math.min(vh-y0,b.h*.6*vh));
+  hx.drawImage(v,x0,y0,w,h,0,0,24,24);
+  const d=hx.getImageData(0,0,24,24).data,Hh=new Float32Array(128);
+  for(let i=0;i<576;i++){const p=i*4,o=i>=288?64:0;Hh[o+(d[p]>>6)*16+(d[p+1]>>6)*4+(d[p+2]>>6)]++}
+  for(let i=0;i<128;i++)Hh[i]/=288;
+  return Hh;
+}
+const inter=(a,b)=>{let s=0;for(let i=0;i<128;i++)s+=Math.min(a[i],b[i]);return s/2};
+const sim=(gal,h)=>{let m=0;for(const g of gal)m=Math.max(m,inter(g,h));return m};
+
+// ---------- IA 2: red neuronal de apariencia (huella de 1280 números por carro) ----------
+let emb=null;
+const ec=document.createElement('canvas');ec.width=ec.height=112;const ecx=ec.getContext('2d');
+async function embed(b){
+  if(!emb)return null;
+  try{
+    const vw=v.videoWidth,vh=v.videoHeight;
+    const x0=Math.max(0,(b.x-b.w/2)*vw),y0=Math.max(0,(b.y-b.h/2)*vh);
+    const w=Math.max(2,Math.min(vw-x0,b.w*vw)),h=Math.max(2,Math.min(vh-y0,b.h*vh));
+    ecx.drawImage(v,x0,y0,w,h,0,0,112,112);
+    const t=tf.tidy(()=>{const f=emb.infer(ec,true);return f.div(f.norm())});
+    const a=await t.data();t.dispose();return a;
+  }catch(e){return null}
+}
+const cos=(a,b)=>{let s=0;for(let i=0;i<a.length;i++)s+=a[i]*b[i];return s};
+
+// ---------- seguidor rápido: corre en cada fotograma ----------
+function grab(){wx.drawImage(v,0,0,W,H);img=wx.getImageData(0,0,W,H).data}
+function sample(cx,cy,bw,bh){
+  const o=new Uint8Array(G*G*3);let k=0;
+  for(let j=0;j<G;j++)for(let i=0;i<G;i++){
+    const x=Math.min(W-1,Math.max(0,Math.round(cx-bw/2+(i+.5)*bw/G))),y=Math.min(H-1,Math.max(0,Math.round(cy-bh/2+(j+.5)*bh/G))),p=(y*W+x)*4;
+    o[k++]=img[p];o[k++]=img[p+1];o[k++]=img[p+2];
+  }
+  return o;
+}
+function cost(cx,cy,bw,bh,t){
+  let s=0,k=0;
+  for(let j=0;j<G;j++)for(let i=0;i<G;i++){
+    const x=Math.min(W-1,Math.max(0,Math.round(cx-bw/2+(i+.5)*bw/G))),y=Math.min(H-1,Math.max(0,Math.round(cy-bh/2+(j+.5)*bh/G))),p=(y*W+x)*4;
+    s+=Math.abs(img[p]-t[k])+Math.abs(img[p+1]-t[k+1])+Math.abs(img[p+2]-t[k+2]);k+=3;
+  }
+  return s/(G*G*3);
+}
+const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
+function step(now){
+  if(!T||state==='lost'||!T.tpl||v.readyState<2)return;
+  const dtf=clamp((now-lastF)/1000,.01,.1);lastF=now;
+  grab();
+  const bw=T.w*W,bh=T.h*H,cx=T.x*W,cy=T.y*H,R=Math.round(Math.max(bw,bh)*.5)+3;
+  let best=1e9,bx=cx,by=cy;
+  for(let y=Math.round(cy)-R;y<=cy+R;y+=2)for(let x=Math.round(cx)-R;x<=cx+R;x+=2){
+    if(x<0||y<0||x>=W||y>=H)continue;
+    const s=cost(x,y,bw,bh,T.tpl);if(s<best){best=s;bx=x;by=y}
+  }
+  if(best<45){
+    const nx=bx/W,ny=by/H;
+    T.vx=clamp(.7*T.vx+.3*(nx-T.x)/dtf,-2,2);T.vy=clamp(.7*T.vy+.3*(ny-T.y)/dtf,-2,2);
+    T.x=nx;T.y=ny;
+  }else{
+    T.x=clamp(T.x+T.vx*dtf,0,1);T.y=clamp(T.y+T.vy*dtf,0,1);T.vx*=.95;T.vy*=.95;
+  }
+  if(++T.n%2===0){T.trail.push([T.x,T.y]);if(T.trail.length>50)T.trail.shift()}
+}
+
+// ---------- IA de detección (corrige al seguidor rápido) ----------
+function loadModel(base){
+  model=null;$('st').textContent='Cargando';$('msg').textContent='Descargando el modelo de IA...';
+  cocoSsd.load({base}).then(m=>{model=m;if(state!=='lost'||!T)state=T?state:'none';if(!detOn){detOn=true;detLoop()}})
+    .catch(()=>{$('st').textContent='Error';$('msg').textContent='No se pudo cargar el modelo. Revisa tu internet.'});
+}
+$('prec').onchange=e=>loadModel(e.target.value);
+async function detLoop(){
+  if(model&&running&&v.readyState>=2&&!busy){
+    busy=true;
+    try{
+      const r=await model.detect(v,12,.25),vw=v.videoWidth,vh=v.videoHeight,n=performance.now();
+      dets=r.filter(o=>VEH.includes(o.class)).map(o=>({x:(o.bbox[0]+o.bbox[2]/2)/vw,y:(o.bbox[1]+o.bbox[3]/2)/vh,w:o.bbox[2]/vw,h:o.bbox[3]/vh}));
+      fps=Math.round(.7*fps+.3*1000/Math.max(1,n-lastDet));lastDet=n;
+      if(T)await update();
+    }catch(e){}
+    busy=false;
+  }
+  setTimeout(detLoop,0);
+}
+async function update(){
+  const now=performance.now(),diag=Math.hypot(T.w,T.h),lostMode=state==='lost';
+  // IA 1 propone candidatos; se ordenan por posición prevista + color
+  const base=dets.map(d=>{
+    const h=hist(d),col=sim(T.gal,h);
+    const pos=lostMode?0:Math.max(0,1-Math.hypot(d.x-T.x,d.y-T.y)/diag/1.2);
+    return{d,h,pos,col,es:null,e:null,sc:lostMode?col:.4*pos+.6*col};
+  }).sort((a,b)=>b.sc-a.sc);
+  // IA 2 revisa a los mejores candidatos solo cuando hay duda (ahorra batería)
+  const need=emb&&T.eg.length&&(lostMode||state!=='ok'||T.conf<.85||dets.length>1);
+  if(need){
+    for(const q of base.slice(0,3)){
+      const e=await embed(q.d);if(!T)return;
+      if(!e)continue;
+      let m=-1;for(const g of T.eg)m=Math.max(m,cos(g,e));
+      q.e=e;q.es=clamp((m-.55)/.4,0,1);
+      const wp=lostMode?0:.3;
+      q.sc=(wp*q.pos+.15*q.col+.55*q.es)/(wp+.7);
+    }
+    base.sort((a,b)=>b.sc-a.sc);
+  }
+  if(!T)return;
+  const b=base[0],s2=base[1];
+  if(b&&b.sc>=(lostMode?.78:.5)){
+    const a=lostMode?1:.6;if(lostMode){T.vx=0;T.vy=0;T.trail=[]}
+    T.x=T.x*(1-a)+b.d.x*a;T.y=T.y*(1-a)+b.d.y*a;T.w=T.w*(1-a)+b.d.w*a;T.h=T.h*(1-a)+b.d.h*a;
+    if(b.sc>.78&&now-T.galT>800){T.gal.push(b.h);if(T.gal.length>6)T.gal.splice(1,1);T.galT=now}
+    // IA 3 enseña a IA 2: si la placa confirmó al carro, su huella se guarda como de confianza
+    const trusted=T.plateOk&&now-T.plateOk<5000;
+    if(b.e&&(b.sc>.78||trusted)&&now-(T.egT||0)>1000){T.eg.push(b.e);if(T.eg.length>6)T.eg.splice(1,1);T.egT=now}
+    if(b.sc>.75){grab();T.tpl=sample(T.x*W,T.y*H,T.w*W,T.h*H)}
+    T.seen=now;T.conf=b.sc;T.ev=[Math.round(b.pos*100),Math.round((b.es!=null?b.es:b.col)*100)];
+    const amb=s2&&s2.sc>b.sc-.1&&Math.hypot(s2.d.x-b.d.x,s2.d.y-b.d.y)>diag*.5;
+    state=amb?'doubt':(b.sc>.7?'ok':'mid');
+  }else if(!lostMode){
+    T.conf*=.85;state=(now-T.seen)<900?'low':'lost';
+  }
+  readPlate();
+}
+
+// ---------- lectura de placa (OCR) ----------
+let ocr=null,ocrBusy=false,lastOcr=0;
+async function initOcr(){
+  try{
+    ocr=await Tesseract.createWorker('eng');
+    await ocr.setParameters({tessedit_char_whitelist:'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',tessedit_pageseg_mode:'11'});
+  }catch(e){ocr=null;$('plateRead').textContent='Lectura de placa no disponible (no cargó el OCR).'}
+}
+const wanted=()=>$('plate').value.toUpperCase().replace(/[^A-Z0-9]/g,'');
+async function readPlate(){
+  if(!ocr||ocrBusy||!T||state==='lost')return;
+  const now=performance.now();if(now-lastOcr<1200)return;
+  const vw=v.videoWidth,vh=v.videoHeight;if(T.w*vw<110)return; // muy lejos para leer
+  lastOcr=now;ocrBusy=true;
+  try{
+    const x0=Math.max(0,(T.x-T.w*.42)*vw),y0=Math.max(0,T.y*vh),w=Math.min(vw-x0,T.w*.84*vw),h=Math.min(vh-y0,T.h*.5*vh);
+    pc.width=Math.round(Math.min(480,w*1.5));pc.height=Math.max(8,Math.round(pc.width*h/w));
+    pcx.filter='grayscale(1) contrast(1.8)';pcx.drawImage(v,x0,y0,w,h,0,0,pc.width,pc.height);
+    const r=await ocr.recognize(pc);
+    evalPlate((r.data.text||'').toUpperCase().replace(/[^A-Z0-9]/g,''));
+  }catch(e){}
+  ocrBusy=false;
+}
+function evalPlate(txt){
+  const want=wanted();let bs=0,bstr='';
+  for(let i=0;i+6<=txt.length;i++){
+    const s6=txt.substr(i,6),L=(s6.match(/[A-Z]/g)||[]).length,D=(s6.match(/[0-9]/g)||[]).length;
+    if(L<2||D<2)continue;
+    let m=6;if(want.length>=6){m=0;for(let k=0;k<6;k++)if(s6[k]===want[k])m++}
+    if(m>bs){bs=m;bstr=s6}
+  }
+  if(!bstr)return;
+  $('plateRead').textContent='Placa leída (puede tener errores): '+bstr.slice(0,3)+'-'+bstr.slice(3);
+  if(want.length>=6){
+    if(bs>=5){T.plateOk=performance.now();T.wrong=0}
+    else if(bs<=2)T.wrong=performance.now();
+  }
+}
+function eff(){
+  if(!T)return state;
+  const n=performance.now();
+  if(state==='lost')return 'lost';
+  if(T.plateOk&&n-T.plateOk<5000)return 'plate';
+  if(T.wrong&&n-T.wrong<4000)return 'doubt2';
+  return state;
+}
+
+// ---------- cámara, video y selección ----------
+function start(){
+  const r=(v.videoWidth||4)/(v.videoHeight||3);
+  stage.style.aspectRatio=r;H=Math.round(W/r);wc.width=W;wc.height=H;fit();
+  empty.style.display='none';v.play().catch(()=>{});running=true;
+  try{navigator.wakeLock&&navigator.wakeLock.request('screen')}catch(e){}
+}
+$('cam').onclick=async()=>{
+  try{
+    const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}},audio:false});
+    v.srcObject=s;v.onloadedmetadata=start;
+    const tr=s.getVideoTracks()[0],cp=tr.getCapabilities?tr.getCapabilities():{};
+    if(cp.zoom){
+      const z=$('zoom');z.min=cp.zoom.min;z.max=cp.zoom.max;z.step=cp.zoom.step||.1;z.value=cp.zoom.min;
+      $('zoomRow').hidden=false;z.oninput=()=>tr.applyConstraints({advanced:[{zoom:+z.value}]}).catch(()=>{});
+    }
+  }catch(e){
+    empty.style.display='flex';
+    empty.textContent='No se pudo abrir la cámara ('+(e&&e.name||'error')+'). Revisa el permiso de Chrome o usa "Elegir video".';
+  }
+};
+$('file').onchange=e=>{
+  const f=e.target.files[0];if(!f)return;
+  v.srcObject=null;v.src=URL.createObjectURL(f);v.loop=true;v.onloadedmetadata=start;v.load();
+};
+$('reset').onclick=()=>{T=null;state='none'};
+c.addEventListener('pointerup',async e=>{
+  if(!running||!model)return;
+  const r=c.getBoundingClientRect(),p={x:(e.clientX-r.left)/r.width,y:(e.clientY-r.top)/r.height};
+  let best=null,bd=.25;
+  for(const d of dets){
+    const inside=Math.abs(p.x-d.x)<d.w/2&&Math.abs(p.y-d.y)<d.h/2,dist=inside?0:Math.hypot(p.x-d.x,p.y-d.y);
+    if(dist<bd){bd=dist;best=d}
+  }
+  if(!best){$('msg').textContent='No hay un carro ahí. Toca uno de los cuadros blancos.';return}
+  const now=performance.now();
+  T={...best,vx:0,vy:0,seen:now,conf:1,gal:[hist(best)],galT:now,plateOk:0,wrong:0,trail:[],n:0,eg:[],ev:null,egT:0};
+  grab();T.tpl=sample(T.x*W,T.y*H,T.w*W,T.h*H);state='ok';
+  const e0=await embed(best);if(e0&&T)T.eg.push(e0);
+});
+
+// ---------- interfaz y dibujo ----------
+const COL={ok:'#1f9d55',mid:'#e0a000',doubt:'#e0a000',doubt2:'#e0a000',low:'#d33a3a',lost:'#d33a3a',plate:'#1f9d55'};
+const TXT={
+  ok:['Seguro','Objetivo localizado.'],
+  mid:['Probable','Lo veo, con menos certeza.'],
+  doubt:['Dudoso','Hay otro carro parecido cerca. No confirmo que sea el mismo.'],
+  doubt2:['Placa distinta','La placa leída no coincide con la tuya. Puede ser otro carro.'],
+  low:['Perdiendo','No lo veo bien. Sigo su movimiento.'],
+  lost:['Perdido','Seguimiento perdido. Lo busco por su apariencia en toda la imagen.'],
+  plate:['Confirmado','La placa leída coincide con la que buscas.'],
+  none:['Listo','Toca un cuadro blanco para elegir el carro a seguir.']
+};
+function ui(){
+  if(!model){return}
+  const e=eff(),t=TXT[e];$('st').textContent=t[0];
+  if(!$('msg').dataset.hold||e!=='none')$('msg').textContent=t[1];
+  const cf=!T?0:(e==='plate'?1:T.conf);
+  $('fill').style.width=Math.round(cf*100)+'%';$('fill').style.background=COL[e]||'#999';
+  $('stats').textContent='IA 1 detecta: '+fps+' análisis/s · '+dets.length+' vehículos';
+  $('trio').textContent='IA 1 detector ✓ · IA 2 apariencia '+(emb?'✓':'cargando…')+' · IA 3 placa '+(ocr?'✓':'cargando…')+(T&&T.ev?' · evidencia: posición '+T.ev[0]+'%, apariencia '+T.ev[1]+'%':'');
+}
+function rect(x,y,w,h,col,lw,dash){
+  ctx.strokeStyle=col;ctx.lineWidth=lw;ctx.setLineDash(dash||[]);
+  ctx.strokeRect((x-w/2)*c.width,(y-h/2)*c.height,w*c.width,h*c.height);ctx.setLineDash([]);
+}
+function draw(){
+  ctx.clearRect(0,0,c.width,c.height);
+  const e=eff();
+  if(!T||e==='lost')for(const d of dets)rect(d.x,d.y,d.w,d.h,'rgba(255,255,255,.85)',1.5);
+  if(T&&e!=='lost'){
+    const col=COL[e];
+    if(T.trail.length>1){
+      ctx.strokeStyle=col;ctx.globalAlpha=.7;ctx.lineWidth=2;ctx.beginPath();
+      T.trail.forEach((p,i)=>i?ctx.lineTo(p[0]*c.width,p[1]*c.height):ctx.moveTo(p[0]*c.width,p[1]*c.height));
+      ctx.stroke();ctx.globalAlpha=1;
+    }
+    rect(T.x,T.y,T.w,T.h,col,3,(e==='low'||e==='doubt'||e==='doubt2')?[8,6]:null);
+    ctx.fillStyle=col;ctx.font='bold 13px sans-serif';
+    ctx.fillText(Math.round((e==='plate'?1:T.conf)*100)+'%',(T.x-T.w/2)*c.width+2,(T.y-T.h/2)*c.height-5);
+  }
+}
+(function loop(){
+  const now=performance.now();if(running)step(now);
+  draw();ui();requestAnimationFrame(loop);
+})();
+
+loadModel('lite_mobilenet_v2');
+mobilenet.load({version:2,alpha:0.5}).then(m=>{emb=m}).catch(()=>{emb=null});
+initOcr();
+</script>
+</body>
+</html>
